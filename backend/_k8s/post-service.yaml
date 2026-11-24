@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: post-service
+  namespace: momnect
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: post-service
+  template:
+    metadata:
+      labels:
+        app: post-service
+    spec:
+      containers:
+        - name: post-service
+          image: junga970/post-service:latest
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: app-secret
+          env:
+            # 공통 Secret의 DB_URL 대신 서비스 전용 DB 주소를 사용 (env가 envFrom보다 우선)
+            - name: DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: app-secret
+                  key: POST_DB_URL

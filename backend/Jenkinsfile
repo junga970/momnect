@@ -1,0 +1,110 @@
+// 전체 서비스 목록 (폴더명 = Docker 이미지명 = k8s Deployment명)
+def ALL_SERVICES = [
+    "chat-service", "discovery-service", "file-service",
+    "gateway-service", "post-service", "product-service",
+    "review-service", "user-service", "websocket-service"
+]
+
+// 이번 빌드에서 배포할 서비스 목록 (Detect Changes 단계에서 결정)
+def targetServices = []
+
+pipeline {
+    agent any
+    triggers {
+        githubPush()
+    }
+    parameters {
+        booleanParam(name: 'DEPLOY_ALL', defaultValue: false, description: '변경 여부와 상관없이 전체 서비스를 배포')
+    }
+    environment {
+        REGISTRY = "junga970"
+        NAMESPACE = "momnect"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    def scmVars = checkout scm
+                    env.CURRENT_COMMIT = scmVars.GIT_COMMIT
+                    // 마지막으로 성공한 빌드의 커밋 (첫 빌드면 없음)
+                    env.PREV_COMMIT = scmVars.GIT_PREVIOUS_SUCCESSFUL_COMMIT ?: ""
+                }
+            }
+        }
+
+        stage('Detect Changes') {
+            steps {
+                script {
+                    if (params.DEPLOY_ALL) {
+                        echo "DEPLOY_ALL=true → 전체 서비스 배포"
+                        targetServices = ALL_SERVICES
+                        return
+                    }
+
+                    // 이전 성공 커밋이 없거나 워크스페이스에서 찾을 수 없으면 전체 배포
+                    def prevExists = env.PREV_COMMIT &&
+                            bat(returnStatus: true, script: "@git rev-parse --verify --quiet ${env.PREV_COMMIT}") == 0
+                    if (!prevExists) {
+                        echo "비교할 이전 성공 커밋이 없음 → 전체 서비스 배포"
+                        targetServices = ALL_SERVICES
+                        return
+                    }
+
+                    // 마지막 성공 빌드 이후 변경된 파일 목록
+                    // (실패한 빌드의 변경분도 다음 성공 빌드 때 함께 배포되도록 이전 '성공' 커밋과 비교)
+                    def changedFiles = bat(
+                            returnStdout: true,
+                            script: "@git diff --name-only ${env.PREV_COMMIT} ${env.CURRENT_COMMIT}"
+                    ).trim().readLines().collect { it.trim().replace('\\', '/') }
+
+                    echo "변경된 파일:\n${changedFiles.join('\n')}"
+
+                    // 서비스 폴더 하위 파일이 바뀐 서비스만 배포 대상
+                    targetServices = ALL_SERVICES.findAll { service ->
+                        changedFiles.any { it.startsWith("${service}/") }
+                    }
+
+                    if (targetServices.isEmpty()) {
+                        echo "변경된 서비스 없음 → 빌드/배포 생략"
+                    } else {
+                        echo "배포 대상: ${targetServices.join(', ')}"
+                    }
+                }
+            }
+        }
+
+        stage('Build & Push Docker Images') {
+            when { expression { !targetServices.isEmpty() } }
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'DOCKERHUB_PASSWORD', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                        bat "echo %DOCKER_PASS% | docker login -u %DOCKER_USER% --password-stdin"
+
+                        for (service in targetServices) {
+                            dir(service) {
+                                bat "echo Building Docker image for ${service}"
+                                bat "docker build -t ${REGISTRY}/${service}:latest ."
+                                bat "docker push ${REGISTRY}/${service}:latest"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Rolling Update Deployments') {
+            when { expression { !targetServices.isEmpty() } }
+            steps {
+                script {
+                    withCredentials([file(credentialsId: 'KUBECONFIG_EC2', variable: 'KUBECONFIG')]) {
+                        for (service in targetServices) {
+                            //bat "kubectl --kubeconfig=%KUBECONFIG% set image deployment/${service} ${service}=${REGISTRY}/${service}:latest -n ${NAMESPACE}"
+                            bat "kubectl --kubeconfig=%KUBECONFIG% rollout restart deployment/${service} -n ${NAMESPACE}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
